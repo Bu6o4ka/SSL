@@ -1,0 +1,332 @@
+# 1. Установка необходимых библиотек
+!pip install torchvision matplotlib tqdm numpy scikit-learn umap-learn
+
+# 2. Импорт библиотек
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.models import resnet18
+from torch.utils.data import DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score
+import umap.umap_ as umap
+from PIL import Image
+
+
+# 3. Проверка доступности GPU и подключение
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Используемое устройство: {device}")
+if torch.cuda.is_available():
+    print(f"Доступно CUDA GPU: {torch.cuda.get_device_name(0)}")
+
+# 4. Параметры эксперимента
+BATCH_SIZE = 512
+EMBEDDING_DIM = 512
+PROJECTION_DIM = 128
+TEMPERATURE = 0.5
+EPOCHS = 40
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+
+# 5. Определение аугментаций для SimCLR
+class SimCLRTransform:
+    def __init__(self):
+        self.transform = transforms.Compose([
+            transforms.RandomResizedCrop(32, scale=(0.08, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.4914, 0.4822, 0.4465],
+                std=[0.2470, 0.2435, 0.2616]
+            )
+        ])
+
+    def __call__(self, x):
+        return self.transform(x), self.transform(x)
+
+# 6. Определение модели SimCLR
+class SimCLR(nn.Module):
+    def __init__(self, base_encoder):
+        super().__init__()
+        self.encoder = base_encoder(pretrained=False)
+        self.encoder.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.encoder.maxpool = nn.Identity()
+        self.encoder.fc = nn.Identity()
+
+        self.projection = nn.Sequential(
+            nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM),
+            nn.ReLU(),
+            nn.Linear(EMBEDDING_DIM, PROJECTION_DIM)
+        )
+
+    def forward(self, x):
+        h = self.encoder(x)
+        z = self.projection(h)
+        return F.normalize(h, dim=1), F.normalize(z, dim=1)
+
+# 7. Loss-функция NT-Xent
+def nt_xent_loss(z1, z2, temperature=TEMPERATURE):
+    z = torch.cat([z1, z2], dim=0)
+    n = z1.size(0)
+    cos_sim = F.cosine_similarity(z.unsqueeze(1), z.unsqueeze(0), dim=2) / temperature
+
+    mask_pos = torch.zeros_like(cos_sim, dtype=torch.bool)
+    mask_pos[torch.arange(n), torch.arange(n) + n] = 1
+    mask_pos[torch.arange(n) + n, torch.arange(n)] = 1
+
+    pos = cos_sim[mask_pos].view(2*n, 1)
+    mask_neg = ~torch.eye(2*n, dtype=torch.bool, device=device)
+    mask_neg[mask_pos] = 0
+    neg = cos_sim[mask_neg].view(2*n, -1)
+
+    logits = torch.cat([pos, neg], dim=1)
+    labels = torch.zeros(2*n, dtype=torch.long, device=device)
+
+    return F.cross_entropy(logits, labels)
+
+# 8. Проверка loss-функции
+print("\nПроверка loss-функции:")
+z1 = torch.randn(10, 128).to(device)
+z2 = torch.randn(10, 128).to(device)
+print("Значение loss:", nt_xent_loss(z1, z2).item())
+
+# 9. Загрузка данных CIFAR-10
+print("\nЗагрузка CIFAR-10...")
+train_transform = SimCLRTransform()
+train_dataset = torchvision.datasets.CIFAR10(
+    root='./data',
+    train=True,
+    download=True
+)
+
+# 10. Проверка аугментаций
+print("\nПроверка аугментаций:")
+test_transform = SimCLRTransform()
+img_pil = Image.fromarray(train_dataset.data[0])
+img1, img2 = test_transform(img_pil)
+
+# Денормализация
+def denormalize(tensor):
+    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+    std = torch.tensor([0.2470, 0.2435, 0.2616]).view(3, 1, 1)
+    return tensor * std + mean  # Обратная нормализация
+
+img1_denorm = denormalize(img1).clamp(0, 1)  # Обрезаем до [0, 1]
+img2_denorm = denormalize(img2).clamp(0, 1)
+
+plt.figure(figsize=(8, 4))
+plt.subplot(1, 2, 1)
+plt.imshow(img1_denorm.permute(1, 2, 0))  # Больше не нужно *0.5 + 0.5
+plt.title("Аугментированная версия 1")
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+plt.imshow(img2_denorm.permute(1, 2, 0))
+plt.title("Аугментированная версия 2")
+plt.axis('off')
+plt.show()
+
+# Повторная инициализация датасета с transform
+train_dataset = torchvision.datasets.CIFAR10(
+    root='./data',
+    train=True,
+    download=True,
+    transform=train_transform
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+# 11. Инициализация модели
+print("\nИнициализация модели...")
+model = SimCLR(resnet18).to(device)
+
+# Проверка модели
+print("\nПроверка модели:")
+x = torch.randn(2, 3, 32, 32).to(device)
+h, z = model(x)
+print("Размеры выходов:", h.shape, z.shape)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY
+)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=len(train_loader)*EPOCHS
+)
+
+# 12. Функция обучения
+def train():
+    model.train()
+    total_loss = 0
+    progress_bar = tqdm(train_loader, desc="Training", leave=False)
+
+    for (x1, x2), _ in progress_bar:
+        x1, x2 = x1.to(device), x2.to(device)
+
+        optimizer.zero_grad()
+        h1, z1 = model(x1)
+        h2, z2 = model(x2)
+        loss = nt_xent_loss(z1, z2)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return total_loss / len(train_loader)
+
+# 13. Цикл обучения
+print("\nНачало обучения...")
+loss_history = []
+for epoch in range(1, EPOCHS+1):
+    avg_loss = train()
+    loss_history.append(avg_loss)
+    print(f"Эпоха [{epoch}/{EPOCHS}], Loss: {avg_loss:.4f}")
+
+# 14. Сохранение модели
+torch.save({
+    'encoder_state_dict': model.encoder.state_dict(),
+    'projection_state_dict': model.projection.state_dict(),
+    'loss_history': loss_history,
+}, 'simclr_model.pth')
+
+print("\nОбучение завершено! Модель сохранена.")
+
+# 15. Визуализация обучения
+plt.figure(figsize=(10, 5))
+plt.plot(loss_history, label='Loss')
+plt.xlabel('Эпоха')
+plt.ylabel('Значение loss')
+plt.title('График обучения SimCLR')
+plt.legend()
+plt.grid()
+plt.show()
+
+# 16. Извлечение эмбеддингов и меток для тестового набора
+def get_embeddings_and_labels(model, dataloader, n_samples=None):
+    model.eval()
+    embeddings = []
+    labels = []
+    
+    with torch.no_grad():
+        for x, y in dataloader:
+            x = x.to(device)
+            h, _ = model(x)
+            embeddings.append(h.cpu())
+            labels.append(y)
+            
+            if n_samples and len(torch.cat(embeddings)) >= n_samples:
+                break
+                
+    return torch.cat(embeddings), torch.cat(labels)
+
+# 17. KNN-классификация
+def evaluate_knn(embeddings_train, labels_train, embeddings_test, labels_test, k=5):
+    knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
+    knn.fit(embeddings_train, labels_train)
+    preds = knn.predict(embeddings_test)
+    accuracy = accuracy_score(labels_test, preds)
+    return accuracy
+
+# 18. Подготовка данных
+print("\nПодготовка данных для KNN...")
+
+# Тестовые данные (нормализованные)
+test_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616])
+])
+test_dataset = torchvision.datasets.CIFAR10(
+    root='./data', train=False, download=True, transform=test_transform)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Обучающие данные (только для KNN - без аугментаций!)
+train_knn_dataset = torchvision.datasets.CIFAR10(
+    root='./data', train=True, download=True, transform=test_transform)
+train_knn_loader = DataLoader(train_knn_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Извлечение эмбеддингов
+print("Извлечение SSL-эмбеддингов...")
+ssl_train_embeddings, ssl_train_labels = get_embeddings_and_labels(model, train_knn_loader, n_samples=5000)
+ssl_test_embeddings, ssl_test_labels = get_embeddings_and_labels(model, test_loader, n_samples=1000)
+
+# 19. KNN на SSL-эмбеддингах
+print("\nОценка KNN на SSL-эмбеддингах...")
+ssl_knn_accuracy = evaluate_knn(
+    ssl_train_embeddings.numpy(), 
+    ssl_train_labels.numpy(),
+    ssl_test_embeddings.numpy(),
+    ssl_test_labels.numpy(),
+    k=5
+)
+print(f"Точность KNN (SSL-эмбеддинги): {ssl_knn_accuracy:.4f}")
+
+# 20. KNN на сырых пикселях (базовая линия)
+print("\nОценка KNN на сырых пикселях...")
+def get_raw_pixels(dataloader, n_samples=None):
+    pixels = []
+    labels = []
+    for x, y in dataloader:
+        pixels.append(x.view(x.size(0), -1).cpu())
+        labels.append(y)
+        if n_samples and len(torch.cat(pixels)) >= n_samples:
+            break
+    return torch.cat(pixels), torch.cat(labels)
+
+raw_train_pixels, raw_train_labels = get_raw_pixels(train_knn_loader, n_samples=5000)
+raw_test_pixels, raw_test_labels = get_raw_pixels(test_loader, n_samples=1000)
+
+raw_knn_accuracy = evaluate_knn(
+    raw_train_pixels.numpy(), 
+    raw_train_labels.numpy(),
+    raw_test_pixels.numpy(),
+    raw_test_labels.numpy(),
+    k=5
+)
+print(f"Точность KNN (сырые пиксели): {raw_knn_accuracy:.4f}")
+
+# 21. Визуализация сравнения
+plt.figure(figsize=(8, 5))
+plt.bar(['Raw Pixels', 'SSL Embeddings'], [raw_knn_accuracy, ssl_knn_accuracy], color=['red', 'green'])
+plt.ylabel('Accuracy')
+plt.title('Сравнение KNN на разных представлениях данных')
+plt.ylim(0, 1)
+plt.grid(True, axis='y')
+plt.show()
+
+# 22. UMAP-визуализация (дополнительно)
+print("\nUMAP-визуализация SSL-эмбеддингов...")
+reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine')
+umap_embeddings = reducer.fit_transform(ssl_test_embeddings.numpy())
+
+plt.figure(figsize=(12, 10))
+scatter = plt.scatter(
+    umap_embeddings[:, 0],
+    umap_embeddings[:, 1],
+    c=ssl_test_labels.numpy(),
+    cmap='tab10',
+    alpha=0.6,
+    s=10
+)
+plt.legend(*scatter.legend_elements(), title="Classes")
+plt.title(f"UMAP визуализация SSL-эмбеддингов (Accuracy: {ssl_knn_accuracy:.2f})")
+plt.show()
