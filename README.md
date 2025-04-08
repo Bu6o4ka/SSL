@@ -1,1 +1,1 @@
-"# Krasnicov_2_t-SNE"  
+«Изучение работы моделей для Selfsupervised learning подхода» 
